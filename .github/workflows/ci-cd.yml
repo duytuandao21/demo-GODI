@@ -1,37 +1,69 @@
 name: CI/CD Pipeline
 
 on:
+  # ========================================
+  # Trigger CI when pushing to:
+  # - main
+  # - feature
+  # - feature/**
+  # ========================================
   push:
     branches:
       - main
       - feature
       - 'feature/**'
 
+  # ========================================
+  # Run CI when creating/updating
+  # Pull Request to main
+  # ========================================
   pull_request:
     branches:
       - main
 
+  # ========================================
+  # Allow manual execution
+  # from GitHub Actions UI
+  # ========================================
   workflow_dispatch:
 
+# ========================================
+# Global Environment Variables
+# ========================================
 env:
   DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/demo-godi
 
+# Only read repository source code
+permissions:
+  contents: read
+
 jobs:
-  # ========================================
+
+  # ==================================================
   # CI - TEST
-  # ========================================
+  # ==================================================
   test:
     name: Run Tests
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 10
 
     defaults:
       run:
         working-directory: src
 
     steps:
+
+      # ----------------------------------------
+      # Checkout repository
+      # ----------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v6
 
+      # ----------------------------------------
+      # Setup Node.js
+      # ----------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -39,103 +71,367 @@ jobs:
           cache: npm
           cache-dependency-path: src/package-lock.json
 
+      # ----------------------------------------
+      # Install dependencies
+      # ----------------------------------------
       - name: Install dependencies
         run: npm ci
 
+      # ----------------------------------------
+      # Run Jest tests
+      # ----------------------------------------
       - name: Run tests
         run: npm test -- --runInBand
 
 
-  # ========================================
+  # ==================================================
   # CD - BUILD & PUSH DOCKER IMAGE
-  # Only run when pushing to main
-  # ========================================
+  #
+  # Only run when:
+  # - push to main
+  # - manually run workflow on main
+  # ==================================================
   build:
     name: Build and Push Docker Image
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 20
 
     needs:
       - test
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch'
+      )
 
     steps:
+
+      # ----------------------------------------
+      # Checkout repository
+      # ----------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v6
 
+      # ----------------------------------------
+      # Login to Docker Hub
+      # ----------------------------------------
       - name: Login to Docker Hub
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # ----------------------------------------
+      # Setup Docker Buildx
+      # ----------------------------------------
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # ----------------------------------------
+      # Build and Push Docker Image
+      #
+      # Two tags:
+      # - commit SHA
+      # - latest
+      # ----------------------------------------
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v7
         with:
           context: ./src
           file: ./src/Dockerfile
           push: true
+
           tags: |
             ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
             ${{ env.DOCKER_IMAGE }}:latest
+
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
 
-  # ========================================
-  # CD - DEPLOY TO AWS EC2
-  # ========================================
+  # ==================================================
+  # CD - DEPLOY TO AWS EC2 INSTANCES
+  #
+  # Deployment order:
+  #
+  # EC2 #1
+  #   ↓
+  # Health Check
+  #   ↓
+  # EC2 #2
+  #   ↓
+  # Health Check
+  #
+  # This reduces downtime behind the Load Balancer.
+  # ==================================================
   deploy:
-    name: Deploy to AWS EC2
+    name: Deploy to EC2 Instances
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 30
 
     needs:
       - build
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch'
+      )
 
     environment:
       name: production
 
+    # Prevent multiple production deployments
+    # from running at the same time.
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+
     steps:
+
+      # ==================================================
+      # CONFIGURE SSH
+      # ==================================================
       - name: Configure SSH
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
 
+          # Create EC2 private key
           printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
 
+          # Add both EC2 hosts to known_hosts
           printf '%s\n' "${{ secrets.EC2_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Deploy application
+
+      # ==================================================
+      # DEPLOY EC2 #1
+      # ==================================================
+      - name: Deploy EC2 #1
+        shell: bash
+
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST: ${{ secrets.EC2_HOST_1 }}
           EC2_USER: ${{ secrets.EC2_USER }}
           IMAGE: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
 
         run: |
-          ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "
-            set -e
+          set -euo pipefail
 
-            echo 'Pulling new Docker image...'
-            sudo docker pull '$IMAGE'
+          echo "========================================="
+          echo "Deploying application to EC2 #1"
+          echo "========================================="
 
-            echo 'Stopping old container...'
-            sudo docker rm -f demo-godi || true
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/ec2_key \
+            "$EC2_USER@$EC2_HOST" \
+            "IMAGE='$IMAGE' bash -s" <<'REMOTE_SCRIPT'
 
-            echo 'Starting new container...'
-            sudo docker run -d \
-              --name demo-godi \
-              --restart unless-stopped \
-              -p 80:3000 \
-              '$IMAGE'
+          set -euo pipefail
 
-            echo 'Cleaning old Docker images...'
-            sudo docker image prune -f
+          echo "Pulling Docker image..."
+          sudo docker pull "$IMAGE"
 
-            echo 'Deployment completed!'
-          "
+          echo "Removing old container..."
+          sudo docker rm -f demo-godi || true
+
+          echo "Starting new container..."
+          sudo docker run -d \
+            --name demo-godi \
+            --restart unless-stopped \
+            -p 80:3000 \
+            "$IMAGE"
+
+          echo "Waiting for application to become healthy..."
+
+          HEALTHY=false
+
+          for attempt in {1..12}; do
+
+            if curl -fsS http://localhost/ > /dev/null; then
+
+              echo "Application is healthy!"
+              HEALTHY=true
+              break
+
+            fi
+
+            echo "Health check failed - attempt $attempt/12"
+            sleep 5
+
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+
+            echo "EC2 #1 health check failed."
+
+            echo "Docker container status:"
+            sudo docker ps -a
+
+            echo "Application logs:"
+            sudo docker logs --tail 100 demo-godi || true
+
+            exit 1
+
+          fi
+
+          echo "========================================="
+          echo "EC2 #1 deployment successful!"
+          echo "========================================="
+
+          REMOTE_SCRIPT
+
+
+      # ==================================================
+      # WAIT FOR LOAD BALANCER HEALTH CHECK
+      #
+      # Allow Target Group some time to detect
+      # EC2 #1 as healthy before updating EC2 #2.
+      # ==================================================
+      - name: Wait for EC2 #1 to stabilize
+        shell: bash
+        run: |
+          echo "Waiting for EC2 #1 to stabilize behind Load Balancer..."
+          sleep 30
+
+
+      # ==================================================
+      # DEPLOY EC2 #2
+      # ==================================================
+      - name: Deploy EC2 #2
+        shell: bash
+
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST_2 }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          IMAGE: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+
+        run: |
+          set -euo pipefail
+
+          echo "========================================="
+          echo "Deploying application to EC2 #2"
+          echo "========================================="
+
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/ec2_key \
+            "$EC2_USER@$EC2_HOST" \
+            "IMAGE='$IMAGE' bash -s" <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          echo "Pulling Docker image..."
+          sudo docker pull "$IMAGE"
+
+          echo "Removing old container..."
+          sudo docker rm -f demo-godi || true
+
+          echo "Starting new container..."
+          sudo docker run -d \
+            --name demo-godi \
+            --restart unless-stopped \
+            -p 80:3000 \
+            "$IMAGE"
+
+          echo "Waiting for application to become healthy..."
+
+          HEALTHY=false
+
+          for attempt in {1..12}; do
+
+            if curl -fsS http://localhost/ > /dev/null; then
+
+              echo "Application is healthy!"
+              HEALTHY=true
+              break
+
+            fi
+
+            echo "Health check failed - attempt $attempt/12"
+            sleep 5
+
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+
+            echo "EC2 #2 health check failed."
+
+            echo "Docker container status:"
+            sudo docker ps -a
+
+            echo "Application logs:"
+            sudo docker logs --tail 100 demo-godi || true
+
+            exit 1
+
+          fi
+
+          echo "========================================="
+          echo "EC2 #2 deployment successful!"
+          echo "========================================="
+
+          REMOTE_SCRIPT
+
+
+      # ==================================================
+      # CLEANUP OLD DOCKER IMAGES
+      # ==================================================
+      - name: Cleanup old Docker images
+        shell: bash
+
+        env:
+          EC2_HOST_1: ${{ secrets.EC2_HOST_1 }}
+          EC2_HOST_2: ${{ secrets.EC2_HOST_2 }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+
+        run: |
+          set -euo pipefail
+
+          echo "Cleaning Docker images on EC2 #1..."
+
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/ec2_key \
+            "$EC2_USER@$EC2_HOST_1" \
+            "sudo docker image prune -f"
+
+          echo "Cleaning Docker images on EC2 #2..."
+
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/ec2_key \
+            "$EC2_USER@$EC2_HOST_2" \
+            "sudo docker image prune -f"
+
+          echo "Docker cleanup completed."
+
+
+      # ==================================================
+      # DEPLOYMENT SUMMARY
+      # ==================================================
+      - name: Deployment completed
+        run: |
+          echo "========================================="
+          echo "Deployment completed successfully!"
+          echo "========================================="
+          echo ""
+          echo "Docker image:"
+          echo "${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
+          echo ""
+          echo "EC2 #1: deployed"
+          echo "EC2 #2: deployed"
+          echo ""
+          echo "Application is ready behind the Load Balancer."
