@@ -45,3 +45,9 @@ The CI/CD pipeline consists of three main stages:
 * **Deploy:** GitLab CI/CD connects to the AWS EC2 instance via SSH, pulls the latest Docker image, stops the old container, and starts a new container.
 
 When new code is pushed to the repository, the pipeline automatically validates the application. Changes pushed to the main branch are then built into a new Docker image and deployed to AWS EC2.
+
+
+
+----
+test1
+----
