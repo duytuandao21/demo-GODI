@@ -89,53 +89,125 @@ jobs:
   # CD - DEPLOY TO AWS EC2
   # ========================================
   deploy:
-    name: Deploy to AWS EC2
-    runs-on: ubuntu-latest
+  name: Deploy to EC2 Instances
 
-    needs:
-      - build
+  runs-on: ubuntu-latest
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  needs:
+    - build
 
-    environment:
-      name: production
+  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
-    steps:
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
+  environment:
+    name: production
 
-          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
+  steps:
+    # ========================================
+    # Configure SSH
+    # ========================================
+    - name: Configure SSH
+      run: |
+        mkdir -p ~/.ssh
 
-          printf '%s\n' "${{ secrets.EC2_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+        printf '%s\n' "${{ secrets.EC2_SSH_KEY }}  " > ~/.ssh/ec2_key
+        chmod 600 ~/.ssh/ec2_key
 
-      - name: Deploy application
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          IMAGE: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+        printf '%s\n' "${{ secrets.EC2_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
 
-        run: |
-          ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "
-            set -e
 
-            echo 'Pulling new Docker image...'
-            sudo docker pull '$IMAGE'
+    # ========================================
+    # Deploy EC2 #1
+    # ========================================
+    - name: Deploy EC2 #1
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST_1 }}
+        EC2_USER: ${{ secrets.EC2_USER }}
+        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/demo-godi:${{ github.sha }}
+      run: |
+        ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "
+          set -e
 
-            echo 'Stopping old container...'
-            sudo docker rm -f demo-godi || true
+          echo '===== Deploying EC2 #1 ====='
 
-            echo 'Starting new container...'
-            sudo docker run -d \
-              --name demo-godi \
-              --restart unless-stopped \
-              -p 80:3000 \
-              '$IMAGE'
+          echo 'Pulling Docker image...'
+          sudo docker pull '$IMAGE'
 
-            echo 'Cleaning old Docker images...'
-            sudo docker image prune -f
+          echo 'Removing old container...'
+          sudo docker rm -f demo-godi || true
 
-            echo 'Deployment completed!'
-          "
+          echo 'Starting new container...'
+          sudo docker run -d \
+            --name demo-godi \
+            --restart unless-stopped \
+            -p 80:3000 \
+            '$IMAGE'
+
+          echo 'Waiting for application...'
+          sleep 5
+
+          echo 'Checking application...'
+          curl --fail http://localhost/ || exit 1
+
+          echo 'EC2 #1 deployment successful!'
+        "
+
+
+    # ========================================
+    # Wait before deploying next instance
+    # ========================================
+    - name: Wait for EC2 #1 to stabilize
+      run: sleep 15
+
+
+    # ========================================
+    # Deploy EC2 #2
+    # ========================================
+    - name: Deploy EC2 #2
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST_2 }}
+        EC2_USER: ${{ secrets.EC2_USER }}
+        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/demo-godi:${{ github.sha }}
+      run: |
+        ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "
+          set -e
+
+          echo '===== Deploying EC2 #2 ====='
+
+          echo 'Pulling Docker image...'
+          sudo docker pull '$IMAGE'
+
+          echo 'Removing old container...'
+          sudo docker rm -f demo-godi || true
+
+          echo 'Starting new container...'
+          sudo docker run -d \
+            --name demo-godi \
+            --restart unless-stopped \
+            -p 80:3000 \
+            '$IMAGE'
+
+          echo 'Waiting for application...'
+          sleep 5
+
+          echo 'Checking application...'
+          curl --fail http://localhost/ || exit 1
+
+          echo 'EC2 #2 deployment successful!'
+        "
+
+
+    # ========================================
+    # Cleanup
+    # ========================================
+    - name: Cleanup old Docker images
+      env:
+        EC2_HOST_1: ${{ secrets.EC2_HOST_1 }}
+        EC2_HOST_2: ${{ secrets.EC2_HOST_2 }}
+        EC2_USER: ${{ secrets.EC2_USER }}
+      run: |
+        ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST_1" \
+          "sudo docker image prune -f"
+
+        ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST_2" \
+          "sudo docker image prune -f"
