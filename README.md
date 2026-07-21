@@ -1,11 +1,13 @@
-# GitHub Actions CI/CD with Docker & AWS EC2
+# GitHub Actions CI/CD with Docker, AWS EC2 & Application Load Balancer
 
-This repository demonstrates an automated **CI/CD pipeline** for a Node.js application using:
+This repository demonstrates an automated CI/CD pipeline for a Node.js application using:
 
-* **GitHub Actions** for CI/CD automation
-* **Docker** for containerizing the application
-* **Docker Hub** for storing Docker images
-* **AWS EC2** for deploying and running the application
+- **GitHub Actions** for CI/CD automation
+- **Docker** for containerizing the application
+- **Docker Hub** for storing Docker images
+- **AWS EC2** for deploying and running multiple application instances
+- **AWS Application Load Balancer (ALB)** for distributing incoming traffic across EC2 instances
+- **AWS Target Group** for health checking and routing requests to healthy EC2 instances
 
 ## CI/CD Workflow
 
@@ -21,12 +23,25 @@ flowchart LR
     F --> G[Run Tests]
     G --> H[Build Docker Image]
     H --> I[Push Image to Docker Hub]
+
     I --> J[Deploy via SSH]
-    J --> K[AWS EC2]
-    K --> L[Pull New Docker Image]
-    L --> M[Stop Old Container]
-    M --> N[Run New Container]
-    N --> O[Application Running<br/>Port 80 → 3000]
+
+    J --> K1[AWS EC2 #1]
+    K1 --> L1[Pull Docker Image]
+    L1 --> M1[Restart Container]
+    M1 --> N1[Health Check]
+
+    N1 --> K2[AWS EC2 #2]
+    K2 --> L2[Pull Docker Image]
+    L2 --> M2[Restart Container]
+    M2 --> N2[Health Check]
+
+    K1 --> TG[AWS Target Group]
+    K2 --> TG
+
+    TG --> ALB[Application Load Balancer]
+
+    ALB --> USER[Users]
 ```
 
 ## Pipeline
@@ -52,7 +67,9 @@ feature/register
 feature/test-ci
 ```
 
-This ensures that new changes are automatically validated before being merged into the main branch.
+This ensures that new changes are automatically validated before being merged into the `main` branch.
+
+Pull Requests targeting the `main` branch also trigger the test stage before the changes are merged.
 
 ### Build
 
@@ -60,112 +77,127 @@ When changes are pushed or merged into the `main` branch:
 
 1. The test job runs first.
 2. A new Docker image is built from the application.
-3. The Docker image is tagged with the Git commit SHA and `latest`.
+3. The Docker image is tagged with both the Git commit SHA and `latest`.
 4. The image is pushed to Docker Hub.
 
 ```text
 GitHub Actions
       │
       ▼
+Run Tests
+      │
+      ▼
 Build Docker Image
       │
       ▼
 Docker Hub
+      │
+      ├── demo-godi:<commit-sha>
+      │
+      └── demo-godi:latest
 ```
+
+Using the Git commit SHA as the deployment tag allows each deployment to reference the exact version of the source code that produced the Docker image.
 
 ### Deploy
 
-After the Docker image is successfully built and pushed, GitHub Actions automatically deploys the application to **AWS EC2**.
+After the Docker image is successfully built and pushed, GitHub Actions automatically deploys the same application version to two AWS EC2 instances.
 
-The deployment process:
+The deployment is performed sequentially to reduce downtime.
 
-1. Connects to the EC2 instance via SSH.
-2. Pulls the new Docker image from Docker Hub.
-3. Stops and removes the previous container.
-4. Starts a new container using the latest image.
-5. Exposes the Node.js application through port `80`.
+The deployment process is:
+
+1. Connect to **EC2 #1** via SSH.
+2. Pull the Docker image identified by the current Git commit SHA.
+3. Stop and remove the previous Docker container.
+4. Start the new container.
+5. Verify the application using a local health check.
+6. Wait for the first instance to stabilize behind the Load Balancer.
+7. Connect to **EC2 #2** via SSH.
+8. Repeat the Docker deployment process.
+9. Verify that the second application instance is healthy.
+10. Clean up unused Docker images.
 
 ```text
 Docker Hub
     │
     ▼
-AWS EC2
+EC2 #1
+    │
+    ├── docker pull
+    ├── docker run
+    └── health check
     │
     ▼
+Wait for stabilization
+    │
+    ▼
+EC2 #2
+    │
+    ├── docker pull
+    ├── docker run
+    └── health check
+```
+
+Each EC2 instance exposes the Node.js application using:
+
+```text
+EC2 Port 80
+     │
+     ▼
 Docker Container
-    │
-    ▼
-Port 80 → Port 3000
+     │
+     ▼
+Node.js Port 3000
 ```
 
-## GitHub Actions Workflow
+Both EC2 instances are registered in an **AWS Target Group**.
 
-The GitHub Actions workflow is located at:
+The **Application Load Balancer** receives incoming HTTP traffic and forwards requests to healthy EC2 targets.
 
 ```text
-.github/workflows/ci-cd.yml
+                         Internet
+                            │
+                            ▼
+                Application Load Balancer
+                            │
+                            ▼
+                      Target Group
+                            │
+                  ┌─────────┴─────────┐
+                  │                   │
+                  ▼                   ▼
+               EC2 #1             EC2 #2
+               Port 80            Port 80
+                  │                   │
+                  ▼                   ▼
+               Docker              Docker
+               Port 3000           Port 3000
 ```
 
-The workflow is automatically triggered when:
-
-```text
-Push to feature/**  → Test
-
-Pull Request → main → Test
-
-Push / Merge → main → Test → Build → Deploy
-```
+The Target Group continuously performs health checks and allows the Load Balancer to route requests only to healthy application instances.
 
 ## Required GitHub Secrets
 
-| Secret               | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `DOCKERHUB_USERNAME` | Docker Hub username                              |
-| `DOCKERHUB_TOKEN`    | Docker Hub Personal Access Token                 |
-| `EC2_HOST`           | AWS EC2 public IP or hostname                    |
-| `EC2_USER`           | EC2 SSH username                                 |
-| `EC2_SSH_KEY`        | Private SSH key for EC2                          |
-| `EC2_KNOWN_HOSTS`    | SSH known hosts information for the EC2 instance |
-
-## Application Architecture
+The following secrets must be configured in:
 
 ```text
-                    ┌─────────────────────┐
-                    │      Developer      │
-                    └──────────┬──────────┘
-                               │
-                            git push
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │       GitHub        │
-                    └──────────┬──────────┘
-                               │
-                  ┌────────────┴────────────┐
-                  │                         │
-             feature/**                   main
-                  │                         │
-                  ▼                         ▼
-          ┌───────────────┐        ┌───────────────┐
-          │   Run Tests   │        │   Run Tests   │
-          └───────────────┘        └───────┬───────┘
-                                           │
-                                           ▼
-                                  ┌─────────────────┐
-                                  │  Build Docker   │
-                                  │      Image      │
-                                  └────────┬────────┘
-                                           │
-                                           ▼
-                                  ┌─────────────────┐
-                                  │   Docker Hub    │
-                                  └────────┬────────┘
-                                           │
-                                           ▼
-                                  ┌─────────────────┐
-                                  │    AWS EC2      │
-                                  │                 │
-                                  │  docker pull    │
-                                  │  docker run     │
-                                  └─────────────────┘
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
 ```
+
+| Secret | Description |
+|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub username |
+| `DOCKERHUB_TOKEN` | Docker Hub Personal Access Token |
+| `EC2_HOST_1` | Public IP or hostname of the first AWS EC2 instance |
+| `EC2_HOST_2` | Public IP or hostname of the second AWS EC2 instance |
+| `EC2_USER` | SSH username used to connect to the EC2 instances |
+| `EC2_SSH_KEY` | Private SSH key used by GitHub Actions to connect to EC2 |
+| `EC2_KNOWN_HOSTS` | SSH known-host entries for both EC2 instances |
+
+Both EC2 instances use the same Docker image version during each deployment.
+
+The Application Load Balancer and Target Group are configured directly in AWS and therefore do not require additional GitHub Secrets for the current deployment workflow.
